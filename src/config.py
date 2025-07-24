@@ -4,7 +4,7 @@ import torch
 
 # --- Directory Paths ---
 # Define paths relative to the project's root directory.
-RAW_DATA_DIR = 'data/raw/'
+RAW_DATA_DIR = 'data'
 PROCESSED_DATA_DIR = 'data/processed/'
 MODEL_DIR = 'models/'
 FIGURE_DIR = 'reports/figures/'
