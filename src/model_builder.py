@@ -1,3 +1,4 @@
+# src/model_builder.py
 import os
 import joblib
 import numpy as np
@@ -5,9 +6,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import GridSearchCV
 from . import config
 
-# --- CORRECTION: Added a simple EarlyStopping class as it was used but not defined. ---
 class EarlyStopping:
     """Stops training when validation loss doesn't improve."""
     def __init__(self, patience=10, min_delta=0):
@@ -56,7 +57,6 @@ class LSTMModel(nn.Module):
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, X):
-        # --- CORRECTION: Changed internal variable 'x' to 'X' to match the input parameter. ---
         out, _ = self.lstm(X)
         last_timestep_out = out[:, -1, :]
         pred = self.fc(last_timestep_out)
@@ -76,11 +76,9 @@ def train_lstm_model(train_seq, train_y, val_seq, val_y, config):
     crit = nn.MSELoss()
     stopper = EarlyStopping(patience=config.LSTM_PATIENCE)
     
-    # --- CORRECTION: Fixed batch_size assignment from '==' to '='. ---
     train_loader = DataLoader(TensorDataset(train_seq, train_y), batch_size=config.LSTM_BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(TensorDataset(val_seq, val_y), batch_size=config.LSTM_BATCH_SIZE, shuffle=False)
 
-    # --- CORRECTION: Corrected typo from LSTM_NUM_EPOCH to LSTM_NUM_EPOCHS. ---
     for epoch in range(config.LSTM_NUM_EPOCHS):
         model.train()
         train_loss = 0.0
@@ -90,7 +88,6 @@ def train_lstm_model(train_seq, train_y, val_seq, val_y, config):
             loss = crit(pred, yb)
             opt.zero_grad()
             loss.backward()
-            # --- CORRECTION: Corrected optimizer step call from 'ste()' to 'step()'. ---
             opt.step()
             train_loss += loss.item() * xb.size(0)
         train_loss /= len(train_loader.dataset)
@@ -118,18 +115,26 @@ def train_lstm_model(train_seq, train_y, val_seq, val_y, config):
     return model
 
 def train_rf_model(X_train, y_train):
-    """Initializes and trains the Random Forest model."""
-    rf = RandomForestRegressor(
-        n_estimators=config.RF_N_ESTIMATORS,
-        max_depth=config.RF_MAX_DEPTH,
-        min_samples_split=config.RF_MIN_SAMPLES_SPLIT,
-        min_samples_leaf=config.RF_MIN_SAMPLES_LEAF,
-        max_features=config.RF_MAX_FEATURES,
-        random_state=42,
-        n_jobs=-1  # Use all available cores
-    )
-    rf.fit(X_train, y_train)
+    """Initializes and trains the Random Forest model using GridSearchCV."""
+    if not config.RF_GRID_SEARCH:
+        print("Skipping Grid Search. Using default Random Forest.")
+        model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+    else:
+        print("Starting GridSearchCV for Random Forest...")
+        rf = RandomForestRegressor(random_state=42, n_jobs=-1)
+        grid_search = GridSearchCV(
+            estimator=rf,
+            param_grid=config.RF_PARAM_GRID,
+            cv=config.RF_CV_FOLDS,
+            scoring='neg_mean_squared_error',
+            verbose=2,
+            n_jobs=-1
+        )
+        grid_search.fit(X_train, y_train)
+        print(f"Best parameters found: {grid_search.best_params_}")
+        model = grid_search.best_estimator_
+
     os.makedirs(config.MODEL_DIR, exist_ok=True)
-    joblib.dump(rf, config.RF_MODEL_PATH)
-    print(f"Random Forest model saved to {config.RF_MODEL_PATH}")
-    return rf
+    joblib.dump(model, config.RF_MODEL_PATH)
+    print(f"Best Random Forest model saved to {config.RF_MODEL_PATH}")
+    return model
