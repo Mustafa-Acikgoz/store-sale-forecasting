@@ -1,3 +1,4 @@
+# config.py
 import torch
 
 # --- Device Configuration ---
@@ -21,17 +22,21 @@ TRANSACTIONS_FILE = "transactions.csv"
 TARGET_COLUMN = "sales"
 SEQUENCE_LENGTH = 30
 TEST_DURATION_DAYS = 16
+SKEW_THRESHOLD = 0.75  # Threshold for applying log transformation
 
-# --- Random Forest Hyperparameters ---
-RF_N_ESTIMATORS = 400
-RF_MAX_DEPTH = 30
-RF_MIN_SAMPLES_SPLIT = 10
-RF_MIN_SAMPLES_LEAF = 4
-RF_MAX_FEATURES = "sqrt"
+# --- Random Forest GridSearchCV Hyperparameters ---
+RF_GRID_SEARCH = True  # Enable/disable grid search
+RF_CV_FOLDS = 3        # Number of cross-validation folds
+RF_PARAM_GRID = {
+    'n_estimators': [100, 200],
+    'max_depth': [10, 20, None],
+    'min_samples_split': [5, 10],
+    'min_samples_leaf': [2, 4]
+}
 RF_MODEL_PATH = f"{MODEL_DIR}/random_forest_model.joblib"
 
 # --- LSTM Hyperparameters ---
-LSTM_INPUT_SIZE = None  # Set at runtime from feature count
+LSTM_INPUT_SIZE = None   # Set at runtime from feature count
 LSTM_HIDDEN_SIZE = 50
 LSTM_NUM_LAYERS = 2
 LSTM_DROPOUT_PROB = 0.2
