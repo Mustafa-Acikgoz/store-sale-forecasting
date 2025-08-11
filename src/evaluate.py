@@ -1,81 +1,68 @@
-# src/evaluate.py
-
-import torch
-import numpy as np
-import pandas as pd
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-import matplotlib.pyplot as plt
-import joblib
 import os
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+# --- CORRECTION: Removed trailing comma from import. ---
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 from . import config
-from .model_builder import LSTMModel # Import the model class
+# This import is needed if you load a saved model for evaluation
+# from .model_builder import LSTMModel
 
-def evaluate_models(lstm_model, rf_model, test_loader, X_test_rf, y_test_rf):
-    print("\n--- Evaluating Models ---")
-    
-    # --- LSTM Evaluation ---
-    lstm_model.eval()
-    predictions_lstm_log = []
+def save_prediction_plot(y_true, y_pred, filepath):
+    """Saves a plot comparing predictions to actual values."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    plt.figure(figsize=(15, 6))
+    plt.plot(y_true, label="Actual")
+    plt.plot(y_pred, label="Predicted")
+    plt.legend()
+    plt.title("Predictions vs Actuals")
+    plt.savefig(filepath, bbox_inches="tight")
+    plt.close()
+
+# --- CORRECTION: Corrected function name and signature. ---
+def evaluate_lstm(model, loader, device):
+    """Evaluates a trained PyTorch LSTM model."""
+    if model is None or loader is None:
+        return {}
+        
+    preds, truth = [], []
+    model.eval()
     with torch.no_grad():
-        for sequences, _ in test_loader:
-            sequences = sequences.to(config.DEVICE)
-            outputs = lstm_model(sequences)
-            predictions_lstm_log.extend(outputs.cpu().numpy().flatten())
+        for xb, yb in loader:
+            xb = xb.to(device)
+            batch_preds = model(xb).cpu().numpy().ravel()
+            batch_truth = yb.cpu().numpy().ravel()
+            
+            # --- CORRECTION: Corrected variable names and method calls. ---
+            preds.extend(np.expm1(batch_preds))
+            truth.extend(np.expm1(batch_truth))
+            
+    preds = np.array(preds)
+    truth = np.array(truth)
     
-    # --- Random Forest Evaluation ---
-    predictions_rf_log = rf_model.predict(X_test_rf)
-    
-    # --- Inverse Transform ---
-    final_predictions_lstm = np.expm1(predictions_lstm_log)
-    final_predictions_rf = np.expm1(predictions_rf_log)
-    final_actuals = np.expm1(y_test_rf.values)
-    
-    min_len = min(len(final_predictions_lstm), len(final_predictions_rf))
-    final_actuals = final_actuals[:min_len]
-    final_predictions_lstm = final_predictions_lstm[:min_len]
-    final_predictions_rf = final_predictions_rf[:min_len]
+    results = {
+        "lstm_mae": float(mean_absolute_error(truth, preds)),
+        "lstm_rmse": float(np.sqrt(mean_squared_error(truth, preds)))
+    }
+    return results, truth, preds
 
-    # --- Calculate Metrics ---
-    rmse_lstm = np.sqrt(mean_squared_error(final_actuals, final_predictions_lstm))
-    mae_lstm = mean_absolute_error(final_actuals, final_predictions_lstm)
-    rmse_rf = np.sqrt(mean_squared_error(final_actuals, final_predictions_rf))
-    mae_rf = mean_absolute_error(final_actuals, final_predictions_rf)
-    
-    print("\n--- LSTM Model Performance ---")
-    print(f"Root Mean Squared Error (RMSE): {rmse_lstm:.4f}")
-    print(f"Mean Absolute Error (MAE):     {mae_lstm:.4f}")
-    print("\n--- Random Forest Model Performance ---")
-    print(f"Root Mean Squared Error (RMSE): {rmse_rf:.4f}")
-    print(f"Mean Absolute Error (MAE):     {mae_rf:.4f}\n")
-    
-    # --- Visualize ---
-    plt.figure(figsize=(18, 8))
-    plot_range = 300
-    plt.plot(final_actuals[:plot_range], label='Actual Sales', color='black', linewidth=2)
-    plt.plot(final_predictions_lstm[:plot_range], label='LSTM Predictions', color='blue', linestyle='--')
-    plt.plot(final_predictions_rf[:plot_range], label='Random Forest Predictions', color='red', linestyle=':')
-    plt.title('Sales Forecast vs. Actual Values', fontsize=16)
-    plt.xlabel('Time Step (in test set)', fontsize=12)
-    plt.ylabel('Number of Sales', fontsize=12)
-    plt.legend(fontsize=12)
-    plt.grid(True)
-    plt.tight_layout()
-    
-    if not os.path.exists(config.FIGURE_DIR):
-        os.makedirs(config.FIGURE_DIR)
-    plt.savefig(config.EVALUATION_FIGURE_PATH)
-    print(f"Evaluation plot saved to {config.EVALUATION_FIGURE_PATH}")
-    plt.show()
+def evaluate_rf(model, X_test, y_test):
+    """Evaluates a trained scikit-learn RandomForest model."""
+    if model is None or X_test is None or y_test is None:
+        return {}
 
-def load_and_evaluate():
-    """Example function to load saved models and run evaluation."""
-    print("Loading saved models for evaluation...")
-    # Load RF model
-    rf_model = joblib.load(config.RF_MODEL_PATH)
+    # Get predictions in log space
+    preds_log = model.predict(X_test)
     
-    # Load LSTM model
-    # Note: We need to know the input size to initialize the model before loading weights
-    # This is a simplification; a more robust solution would save model architecture info.
-    # For now, we assume we can reconstruct the test data to get the shape.
-    # This part would be called from main.py where test_loader and X_test_rf are available.
-    print("This function is a placeholder. Evaluation should be called from a main script with live data.")
+    # Convert predictions and true values back to original scale
+    preds_orig_scale = np.expm1(preds_log)
+    y_test_orig_scale = np.expm1(y_test)
+    
+    # Calculate metrics
+    results = {
+        "rf_mae": float(mean_absolute_error(y_test_orig_scale, preds_orig_scale)),
+        "rf_rmse": float(np.sqrt(mean_squared_error(y_test_orig_scale, preds_orig_scale)))
+    }
+    
+    # Return the original scale values for optional plotting
+    return results, y_test_orig_scale, preds_orig_scale

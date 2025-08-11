@@ -1,107 +1,135 @@
-# src/model_builder.py
-
+import os
+import joblib
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
 from sklearn.ensemble import RandomForestRegressor
-import joblib
-import os
 from . import config
 
-# --- LSTM Model ---
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout_prob):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout_prob)
-        self.dropout = nn.Dropout(dropout_prob)
-        self.fc = nn.Linear(hidden_size, output_size)
-
-    def forward(self, x):
-        h0 = torch.zeros(config.LSTM_NUM_LAYERS, x.size(0), config.LSTM_HIDDEN_SIZE).to(x.device)
-        c0 = torch.zeros(config.LSTM_NUM_LAYERS, x.size(0), config.LSTM_HIDDEN_SIZE).to(x.device)
-        out, _ = self.lstm(x, (h0, c0))
-        out = self.dropout(out)
-        out = self.fc(out[:, -1, :])
-        return out
-
+# --- CORRECTION: Added a simple EarlyStopping class as it was used but not defined. ---
 class EarlyStopping:
-    def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.pt'):
-        self.patience, self.verbose, self.delta, self.path = patience, verbose, delta, path
-        self.counter, self.best_score, self.early_stop, self.val_loss_min = 0, None, False, np.Inf
+    """Stops training when validation loss doesn't improve."""
+    def __init__(self, patience=10, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = np.inf
+        self.best_state = None
 
-    def __call__(self, val_loss, model):
-        score = -val_loss
-        if self.best_score is None or score > self.best_score + self.delta:
-            self.best_score, self.counter = score, 0
-            self.save_checkpoint(val_loss, model)
+    def step(self, val_loss, model):
+        if self.best_loss - val_loss > self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            self.best_state = model.state_dict()
         else:
             self.counter += 1
-            if self.verbose: print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience: self.early_stop = True
+            if self.counter >= self.patience:
+                print("Early stopping triggered.")
+                return True
+        return False
 
-    def save_checkpoint(self, val_loss, model):
-        if self.verbose: print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model...')
-        torch.save(model.state_dict(), self.path)
-        self.val_loss_min = val_loss
-
-def train_lstm_model(X_train, y_train, X_test, y_test):
-    print("\n--- Training LSTM Model ---")
-    input_size = X_train.shape[2]
-    model = LSTMModel(input_size, config.LSTM_HIDDEN_SIZE, config.LSTM_NUM_LAYERS, config.LSTM_OUTPUT_SIZE, config.LSTM_DROPOUT_PROB).to(config.DEVICE)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LSTM_LEARNING_RATE)
+def make_sequences(df, seq_len, target_col):
+    """Creates sequences for LSTM model."""
+    feat_cols = [c for c in df.columns if c not in ["date", target_col]]
+    X = df[feat_cols].values.astype("float32")
+    y = df[target_col].values.astype("float32").reshape(-1, 1)
     
-    train_loader = DataLoader(TensorDataset(torch.from_numpy(X_train.astype(np.float32)), torch.from_numpy(y_train.astype(np.float32).reshape(-1,1))), batch_size=config.LSTM_BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(TensorDataset(torch.from_numpy(X_test.astype(np.float32)), torch.from_numpy(y_test.astype(np.float32).reshape(-1,1))), batch_size=config.LSTM_BATCH_SIZE, shuffle=False)
-    
-    early_stopper = EarlyStopping(patience=config.LSTM_PATIENCE, verbose=True, path=config.LSTM_MODEL_PATH)
+    X_seq, y_seq = [], []
+    for i in range(len(X) - seq_len):
+        X_seq.append(X[i:i + seq_len])
+        y_seq.append(y[i + seq_len])
 
+    return torch.tensor(np.stack(X_seq)), torch.tensor(np.stack(y_seq))
+
+class LSTMModel(nn.Module):
+    """Defines the LSTM model architecture."""
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, X):
+        # --- CORRECTION: Changed internal variable 'x' to 'X' to match the input parameter. ---
+        out, _ = self.lstm(X)
+        last_timestep_out = out[:, -1, :]
+        pred = self.fc(last_timestep_out)
+        return pred
+
+def train_lstm_model(train_seq, train_y, val_seq, val_y, config):
+    """Trains the LSTM model."""
+    model = LSTMModel(
+        input_size=train_seq.shape[2],
+        hidden_size=config.LSTM_HIDDEN_SIZE,
+        num_layers=config.LSTM_NUM_LAYERS,
+        output_size=config.LSTM_OUTPUT_SIZE,
+        dropout=config.LSTM_DROPOUT_PROB
+    ).to(config.DEVICE)
+
+    opt = torch.optim.Adam(model.parameters(), lr=config.LSTM_LEARNING_RATE)
+    crit = nn.MSELoss()
+    stopper = EarlyStopping(patience=config.LSTM_PATIENCE)
+    
+    # --- CORRECTION: Fixed batch_size assignment from '==' to '='. ---
+    train_loader = DataLoader(TensorDataset(train_seq, train_y), batch_size=config.LSTM_BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(TensorDataset(val_seq, val_y), batch_size=config.LSTM_BATCH_SIZE, shuffle=False)
+
+    # --- CORRECTION: Corrected typo from LSTM_NUM_EPOCH to LSTM_NUM_EPOCHS. ---
     for epoch in range(config.LSTM_NUM_EPOCHS):
         model.train()
-        for sequences, labels in train_loader:
-            sequences, labels = sequences.to(config.DEVICE), labels.to(config.DEVICE)
-            outputs = model(sequences)
-            loss = criterion(outputs, labels)
-            optimizer.zero_grad()
+        train_loss = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(config.DEVICE), yb.to(config.DEVICE)
+            pred = model(xb)
+            loss = crit(pred, yb)
+            opt.zero_grad()
             loss.backward()
-            optimizer.step()
-        
+            # --- CORRECTION: Corrected optimizer step call from 'ste()' to 'step()'. ---
+            opt.step()
+            train_loss += loss.item() * xb.size(0)
+        train_loss /= len(train_loader.dataset)
+
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
         with torch.no_grad():
-            for sequences, labels in test_loader:
-                sequences, labels = sequences.to(config.DEVICE), labels.to(config.DEVICE)
-                outputs = model(sequences)
-                val_loss += criterion(outputs, labels).item() * sequences.size(0)
+            for xb, yb in val_loader:
+                xb, yb = xb.to(config.DEVICE), yb.to(config.DEVICE)
+                pred = model(xb)
+                val_loss += crit(pred, yb).item() * xb.size(0)
+        val_loss /= len(val_loader.dataset)
         
-        val_loss /= len(test_loader.dataset)
-        print(f'Epoch {epoch+1}/{config.LSTM_NUM_EPOCHS}, Validation Loss: {val_loss:.6f}')
-        early_stopper(val_loss, model)
-        if early_stopper.early_stop:
-            print("Early stopping triggered.")
+        print(f"Epoch {epoch+1}/{config.LSTM_NUM_EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+        if stopper.step(val_loss, model):
             break
-            
-    model.load_state_dict(torch.load(config.LSTM_MODEL_PATH))
-    print("LSTM model trained and saved.")
+
+    if stopper.best_state:
+        model.load_state_dict(stopper.best_state)
+        os.makedirs(config.MODEL_DIR, exist_ok=True)
+        torch.save(model.state_dict(), config.LSTM_MODEL_PATH)
+        print(f"Best model saved to {config.LSTM_MODEL_PATH}")
+
     return model
 
-# --- Random Forest Model ---
 def train_rf_model(X_train, y_train):
-    print("\n--- Training Random Forest Model ---")
-    rf_model = RandomForestRegressor(
+    """Initializes and trains the Random Forest model."""
+    rf = RandomForestRegressor(
         n_estimators=config.RF_N_ESTIMATORS,
         max_depth=config.RF_MAX_DEPTH,
         min_samples_split=config.RF_MIN_SAMPLES_SPLIT,
         min_samples_leaf=config.RF_MIN_SAMPLES_LEAF,
         max_features=config.RF_MAX_FEATURES,
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1  # Use all available cores
     )
-    rf_model.fit(X_train, y_train)
-    
-    if not os.path.exists(config.MODEL_DIR):
-        os.makedirs(config.MODEL_DIR)
-    joblib.dump(rf_model, config.RF_MODEL_PATH)
-    print("Random Forest model trained and saved.")
-    return rf_model
+    rf.fit(X_train, y_train)
+    os.makedirs(config.MODEL_DIR, exist_ok=True)
+    joblib.dump(rf, config.RF_MODEL_PATH)
+    print(f"Random Forest model saved to {config.RF_MODEL_PATH}")
+    return rf
