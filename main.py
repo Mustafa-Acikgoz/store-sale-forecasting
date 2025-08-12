@@ -1,65 +1,41 @@
-# main.py
-import pandas as pd
-from torch.utils.data import DataLoader, TensorDataset
-
-# Import project modules
-from src import config
 from src import data_preprocessing as dp
 from src import model_builder as mb
-from src import evaluate as ev
-
-def run_lstm_pipeline(train_df, test_df, config, model_builder, evaluator, log_transformed):
-    """Prepares data, trains, and evaluates the LSTM model."""
-    print("\n--- Running LSTM Pipeline ---")
-    
-    print("Creating sequences...")
-    X_train_seq, y_train_seq = model_builder.make_sequences(train_df, config.SEQUENCE_LENGTH, config.TARGET_COLUMN)
-    X_test_seq, y_test_seq = model_builder.make_sequences(test_df, config.SEQUENCE_LENGTH, config.TARGET_COLUMN)
-    
-    print("Training LSTM...")
-    lstm_model = model_builder.train_lstm_model(X_train_seq, y_train_seq, X_test_seq, y_test_seq, config)
-    
-    print("Evaluating LSTM...")
-    test_loader = DataLoader(TensorDataset(X_test_seq, y_test_seq), batch_size=config.LSTM_BATCH_SIZE)
-    lstm_results, _, _ = evaluator.evaluate_lstm(lstm_model, test_loader, config.DEVICE, log_transformed)
-    
-    print(f"LSTM Results: {lstm_results}")
-    return lstm_model, lstm_results
-
-def run_rf_pipeline(train_rf, test_rf, config, model_builder, evaluator, log_transformed):
-    """Prepares data, trains, and evaluates the Random Forest model."""
-    print("\n--- Running Random Forest Pipeline ---")
-    
-    train_features = [c for c in train_rf.columns if c not in ["date", config.TARGET_COLUMN]]
-    X_train_rf = train_rf[train_features].values
-    y_train_rf = train_rf[config.TARGET_COLUMN].values
-    
-    test_features = [c for c in test_rf.columns if c not in ["date", config.TARGET_COLUMN]]
-    X_test_rf = test_rf[test_features].values
-    y_test_rf = test_rf[config.TARGET_COLUMN].values
-    
-    print("Training Random Forest...")
-    rf_model = model_builder.train_rf_model(X_train_rf, y_train_rf)
-    
-    print("Evaluating Random Forest...")
-    rf_results, _, _ = evaluator.evaluate_rf(rf_model, X_test_rf, y_test_rf, log_transformed)
-    
-    print(f"Random Forest Results: {rf_results}")
-    return rf_model, rf_results
+from src import config
+from torch.utils.data import TensorDataset, DataLoader
+import torch
+from src.evaluate import evaluate_lstm, save_prediction_plot, save_model_weights
 
 def main():
-    """Main function to run the entire ML pipeline."""
-    print("--- Starting Data Preprocessing Pipeline ---")
-    data, holidays = dp.load_and_merge_data()
-    features = dp.create_features(data, holidays)
-    train_df, test_df, train_rf, test_rf, scaler, log_transformed = dp.preprocess_for_modeling(features)
+    # basic leak guard
+    assert config.TARGET_COLUMN not in config.NUMERICAL_COLS, "Leak: raw target in NUMERICAL_COLS."
 
-    rf_model, rf_results = run_rf_pipeline(train_rf, test_rf, config, mb, ev, log_transformed)
-    lstm_model, lstm_results = run_lstm_pipeline(train_df, test_df, config, mb, ev, log_transformed)
+    # load + features
+    df, holidays = dp.load_and_merge_data()
+    df = dp.create_features(df, holidays)
 
-    print("\n--- All Pipelines Complete ---")
-    print("Final Random Forest Results:", rf_results)
-    print("Final LSTM Results:", lstm_results)
+    # sequences
+    print(f"Target skew: {df[config.TARGET_COLUMN].skew():.2f}")
+    Xc_tr, Xn_tr, y_tr, Xc_te, Xn_te, y_te, vocab_sizes, emb_dims, log_t = dp.make_sequences_for_embedding(df)
+    print(f"Train seqs: {len(y_tr):,} | Test seqs: {len(y_te):,} | SEQ_LEN={config.SEQ_LEN}, TEST_DAYS={config.TEST_DURATION_DAYS}")
+    if len(y_te) == 0:
+        raise RuntimeError("No test sequences. Adjust SEQ_LEN/TEST_DURATION_DAYS.")
+
+    # train
+    model = mb.train_lstm_model(Xc_tr, Xn_tr, y_tr, Xc_te, Xn_te, y_te, vocab_sizes, emb_dims, log_t)
+
+    # evaluate
+    val_ds = TensorDataset(
+        torch.tensor(Xc_te, dtype=torch.long),
+        torch.tensor(Xn_te, dtype=torch.float32),
+        torch.tensor(y_te,  dtype=torch.float32),
+    )
+    val_loader = DataLoader(val_ds, batch_size=config.LSTM_BATCH_SIZE, shuffle=False)
+    metrics, y_true, y_pred = evaluate_lstm(model, val_loader, config.DEVICE, log_t)
+    print(metrics)
+    save_prediction_plot(y_true, y_pred, "artifacts/lstm_pred_vs_actual.png")
+
+    # save
+    save_model_weights(model, "artifacts/lstm_weights.pth")
 
 if __name__ == "__main__":
     main()

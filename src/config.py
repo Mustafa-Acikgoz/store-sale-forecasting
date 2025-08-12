@@ -1,48 +1,37 @@
-# config.py
 import torch
 
-# --- Device Configuration ---
+# Device for training
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- Directory Paths ---
+# Data file paths
 RAW_DATA_DIR = "data"
-PROCESSED_DATA_DIR = "data/processed"
-MODEL_DIR = "models"
-FIGURE_DIR = "reports/figures"
-
-# --- File Paths ---
-EVALUATION_FIGURE_PATH = f"{FIGURE_DIR}/prediction_vs_actuals.png"
 TRAIN_FILE = "train.csv"
 STORES_FILE = "stores.csv"
 HOLIDAYS_FILE = "holidays_events.csv"
 OIL_FILE = "oil.csv"
 TRANSACTIONS_FILE = "transactions.csv"
 
-# --- Model & Data Parameters ---
+# Target and data split settings
 TARGET_COLUMN = "sales"
-SEQUENCE_LENGTH = 30
-TEST_DURATION_DAYS = 16
-SKEW_THRESHOLD = 0.75  # Threshold for applying log transformation
+TEST_DURATION_DAYS = 32
+SKEW_THRESHOLD = 0.75
 
-# --- Random Forest GridSearchCV Hyperparameters ---
-RF_GRID_SEARCH = True  # Enable/disable grid search
-RF_CV_FOLDS = 3        # Number of cross-validation folds
-RF_PARAM_GRID = {
-    'n_estimators': [100, 200],
-    'max_depth': [10, 20, None],
-    'min_samples_split': [5, 10],
-    'min_samples_leaf': [2, 4]
-}
-RF_MODEL_PATH = f"{MODEL_DIR}/random_forest_model.joblib"
-
-# --- LSTM Hyperparameters ---
-LSTM_INPUT_SIZE = None   # Set at runtime from feature count
-LSTM_HIDDEN_SIZE = 50
-LSTM_NUM_LAYERS = 2
-LSTM_DROPOUT_PROB = 0.2
+# LSTM hyperparameters
+SEQ_LEN = 28
+LSTM_HIDDEN_SIZE = 40
+LSTM_NUM_LAYERS = 1
+LSTM_DROPOUT_PROB = 0.4
 LSTM_OUTPUT_SIZE = 1
-LSTM_LEARNING_RATE = 1e-3
-LSTM_BATCH_SIZE = 64
-LSTM_NUM_EPOCHS = 100
-LSTM_PATIENCE = 10
-LSTM_MODEL_PATH = f"{MODEL_DIR}/lstm_model.pt"
+LSTM_LR = 3e-4
+LSTM_EPOCHS = 20
+LSTM_BATCH_SIZE = 1024
+
+# Feature columns
+CATEGORICAL_COLS = ["store_nbr", "family", "city", "state", "type", "cluster"]
+
+NUMERICAL_COLS = [
+    "onpromotion", "transactions", "dcoilwtico",
+    "dayofweek", "weekofyear", "month", "year", "is_weekend", "is_holiday",
+    "sales_lag_7", "sales_lag_14", "sales_lag_28",
+    "sales_rolling_mean_7", "sales_rolling_mean_28",
+]

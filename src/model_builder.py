@@ -1,140 +1,109 @@
-# src/model_builder.py
-import os
-import joblib
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import r2_score
 from . import config
 
-class EarlyStopping:
-    """Stops training when validation loss doesn't improve."""
-    def __init__(self, patience=10, min_delta=0):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = np.inf
-        self.best_state = None
-
-    def step(self, val_loss, model):
-        if self.best_loss - val_loss > self.min_delta:
-            self.best_loss = val_loss
-            self.counter = 0
-            self.best_state = model.state_dict()
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                print("Early stopping triggered.")
-                return True
-        return False
-
-def make_sequences(df, seq_len, target_col):
-    """Creates sequences for LSTM model."""
-    feat_cols = [c for c in df.columns if c not in ["date", target_col]]
-    X = df[feat_cols].values.astype("float32")
-    y = df[target_col].values.astype("float32").reshape(-1, 1)
-    
-    X_seq, y_seq = [], []
-    for i in range(len(X) - seq_len):
-        X_seq.append(X[i:i + seq_len])
-        y_seq.append(y[i + seq_len])
-
-    return torch.tensor(np.stack(X_seq)), torch.tensor(np.stack(y_seq))
 
 class LSTMModel(nn.Module):
-    """Defines the LSTM model architecture."""
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout):
+    def __init__(self, vocab_sizes, emb_dims, num_numerical_features):
         super().__init__()
+        self.cat_cols = list(vocab_sizes.keys())
+
+        # one embedding per categorical column
+        self.embeddings = nn.ModuleDict({
+            f"cat_{col}": nn.Embedding(vocab_sizes[col], emb_dims[col])
+            for col in self.cat_cols
+        })
+
+        total_embed_dim = sum(emb_dims.values())
+        lstm_input_size = total_embed_dim + num_numerical_features
+
+        self.dropout = nn.Dropout(config.LSTM_DROPOUT_PROB)
         self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
+            input_size=lstm_input_size,
+            hidden_size=config.LSTM_HIDDEN_SIZE,
+            num_layers=config.LSTM_NUM_LAYERS,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0
+            dropout=config.LSTM_DROPOUT_PROB if config.LSTM_NUM_LAYERS > 1 else 0.0,
         )
-        self.fc = nn.Linear(hidden_size, output_size)
+        self.fc = nn.Linear(config.LSTM_HIDDEN_SIZE, config.LSTM_OUTPUT_SIZE)
 
-    def forward(self, X):
-        out, _ = self.lstm(X)
-        last_timestep_out = out[:, -1, :]
-        pred = self.fc(last_timestep_out)
-        return pred
+    def forward(self, x_cat, x_num):
+        # x_cat: [B, T, Ccat], x_num: [B, T, Cnum]
+        embeds = [self.embeddings[f"cat_{col}"](x_cat[:, :, i]) for i, col in enumerate(self.cat_cols)]
+        x_emb = torch.cat(embeds, dim=-1)                       # [B, T, sum(emb_dims)]
+        x_in  = torch.cat([x_emb, x_num], dim=-1) if x_num.shape[-1] > 0 else x_emb
+        x_in  = self.dropout(x_in)
 
-def train_lstm_model(train_seq, train_y, val_seq, val_y, config):
-    """Trains the LSTM model."""
-    model = LSTMModel(
-        input_size=train_seq.shape[2],
-        hidden_size=config.LSTM_HIDDEN_SIZE,
-        num_layers=config.LSTM_NUM_LAYERS,
-        output_size=config.LSTM_OUTPUT_SIZE,
-        dropout=config.LSTM_DROPOUT_PROB
-    ).to(config.DEVICE)
+        out, _ = self.lstm(x_in)                                # [B, T, H]
+        last  = out[:, -1, :]                                   # last timestep
+        return self.fc(last).squeeze(-1)                        # [B]
 
-    opt = torch.optim.Adam(model.parameters(), lr=config.LSTM_LEARNING_RATE)
+
+def train_lstm_model(Xc_tr, Xn_tr, y_tr, Xc_te, Xn_te, y_te, vocab_sizes, emb_dims, log_transformed):
+    device = config.DEVICE
+
+    num_num_features = Xn_tr.shape[2] if Xn_tr.ndim == 3 else 0
+    model = LSTMModel(vocab_sizes, emb_dims, num_num_features).to(device)
+
+    # datasets & loaders
+    train_ds = TensorDataset(
+        torch.tensor(Xc_tr, dtype=torch.long),
+        torch.tensor(Xn_tr, dtype=torch.float32),
+        torch.tensor(y_tr,  dtype=torch.float32),
+    )
+    val_ds = TensorDataset(
+        torch.tensor(Xc_te, dtype=torch.long),
+        torch.tensor(Xn_te, dtype=torch.float32),
+        torch.tensor(y_te,  dtype=torch.float32),
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=config.LSTM_BATCH_SIZE, shuffle=True)
+    val_loader   = DataLoader(val_ds,   batch_size=config.LSTM_BATCH_SIZE, shuffle=False)
+
     crit = nn.MSELoss()
-    stopper = EarlyStopping(patience=config.LSTM_PATIENCE)
-    
-    train_loader = DataLoader(TensorDataset(train_seq, train_y), batch_size=config.LSTM_BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(TensorDataset(val_seq, val_y), batch_size=config.LSTM_BATCH_SIZE, shuffle=False)
+    opt  = torch.optim.Adam(model.parameters(), lr=config.LSTM_LR)
 
-    for epoch in range(config.LSTM_NUM_EPOCHS):
+    for epoch in range(config.LSTM_EPOCHS):
+        # ---- train ----
         model.train()
-        train_loss = 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(config.DEVICE), yb.to(config.DEVICE)
-            pred = model(xb)
+        tr_loss = 0.0
+        for xc, xn, yb in train_loader:
+            xc, xn, yb = xc.to(device), xn.to(device), yb.to(device)
+            opt.zero_grad(set_to_none=True)
+            pred = model(xc, xn)
             loss = crit(pred, yb)
-            opt.zero_grad()
             loss.backward()
             opt.step()
-            train_loss += loss.item() * xb.size(0)
-        train_loss /= len(train_loader.dataset)
+            tr_loss += loss.item() * xc.size(0)
+        tr_loss /= max(1, len(train_loader.dataset))
 
+        # ---- validate ----
         model.eval()
-        val_loss = 0.0
+        va_loss, y_true, y_pred = 0.0, [], []
         with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(config.DEVICE), yb.to(config.DEVICE)
-                pred = model(xb)
-                val_loss += crit(pred, yb).item() * xb.size(0)
-        val_loss /= len(val_loader.dataset)
-        
-        print(f"Epoch {epoch+1}/{config.LSTM_NUM_EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            for xc, xn, yb in val_loader:
+                xc, xn, yb = xc.to(device), xn.to(device), yb.to(device)
+                pr = model(xc, xn)
+                loss = crit(pr, yb)
+                va_loss += loss.item() * xc.size(0)
+                y_true.extend(yb.detach().cpu().numpy())
+                y_pred.extend(pr.detach().cpu().numpy())
+        va_loss /= max(1, len(val_loader.dataset))
 
-        if stopper.step(val_loss, model):
-            break
+        # metrics (both spaces)
+        r2_log = r2_score(y_true, y_pred)
+        if log_transformed:
+            y_true_o = np.expm1(y_true)
+            y_pred_o = np.expm1(y_pred)
+            r2_o     = r2_score(y_true_o, y_pred_o)
+        else:
+            r2_o = r2_log
 
-    if stopper.best_state:
-        model.load_state_dict(stopper.best_state)
-        os.makedirs(config.MODEL_DIR, exist_ok=True)
-        torch.save(model.state_dict(), config.LSTM_MODEL_PATH)
-        print(f"Best model saved to {config.LSTM_MODEL_PATH}")
+        print(f"Epoch {epoch+1}/{config.LSTM_EPOCHS} | "
+              f"Train {tr_loss:.4f} | Val {va_loss:.4f} | "
+              f"R2_log {r2_log:.4f} | R2_orig {r2_o:.4f}")
 
-    return model
-
-def train_rf_model(X_train, y_train):
-    """Initializes and trains the Random Forest model using GridSearchCV."""
-    if not config.RF_GRID_SEARCH:
-        print("Skipping Grid Search. Using default Random Forest.")
-        model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-    else:
-        print("Starting GridSearchCV for Random Forest...")
-        rf = RandomForestRegressor(random_state=42, n_jobs=-1)
-        grid_search = GridSearchCV(
-            estimator=rf,
-            param_grid=config.RF_PARAM_GRID,
-            cv=config.RF_CV_FOLDS,
-            scoring='neg_mean_squared_error',
-            verbose=2,
-            n_jobs=-1
-        )
-        grid_search.fit(X_train, y_train)
-        print(f"Best parameters found: {grid_search.best_params_}")
-        model = grid_search.best_estimator_
-
-    os.makedirs(config.MODEL_DIR, exist_ok=True)
-    joblib.dump(model, config.RF_MODEL_PATH)
-    print(f"Best Random Forest model saved to {config.RF_MODEL_PATH}")
     return model
